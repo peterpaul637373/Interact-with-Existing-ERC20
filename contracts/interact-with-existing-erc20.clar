@@ -9,6 +9,8 @@
 (define-constant ERR_ALREADY_EXISTS (err u107))
 (define-constant ERR_NOT_FOUND (err u108))
 (define-constant ERR_NO_REWARDS (err u109))
+(define-constant ERR_STILL_LOCKED (err u110))
+(define-constant ERR_INVALID_LOCK_PERIOD (err u111))
 
 (define-map supported-tokens principal bool)
 (define-map user-deposits { user: principal, token: principal } uint)
@@ -17,6 +19,8 @@
 (define-map user-last-reward-block { user: principal, token: principal } uint)
 (define-map user-earned-rewards { user: principal, token: principal } uint)
 (define-map token-reward-rates principal uint)
+(define-map locked-deposits { user: principal, token: principal } { amount: uint, unlock-block: uint, bonus-rate: uint, deposit-block: uint })
+(define-map lock-period-rates uint uint)
 
 (define-data-var contract-paused bool false)
 (define-data-var deposit-fee uint u50)
@@ -286,3 +290,89 @@
   (default-to u0 (map-get? user-earned-rewards { user: user, token: token-contract }))
 )
 
+(define-public (set-lock-period-rate (lock-blocks uint) (bonus-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= bonus-rate u5000) ERR_INVALID_AMOUNT)
+    (map-set lock-period-rates lock-blocks bonus-rate)
+    (ok bonus-rate)
+  )
+)
+
+(define-public (deposit-locked (token-contract <sip010-token>) (amount uint) (lock-blocks uint))
+  (let
+    (
+      (token-principal (contract-of token-contract))
+      (current-balance (unwrap! (contract-call? token-contract get-balance tx-sender) ERR_TRANSFER_FAILED))
+      (fee-amount (/ (* amount (var-get deposit-fee)) u10000))
+      (deposit-amount (- amount fee-amount))
+      (total-token-deposits (default-to u0 (map-get? total-deposits token-principal)))
+      (unlock-block (+ stacks-block-height lock-blocks))
+      (bonus-rate (default-to u0 (map-get? lock-period-rates lock-blocks)))
+      (existing-lock (map-get? locked-deposits { user: tx-sender, token: token-principal }))
+    )
+    (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+    (asserts! (default-to false (map-get? supported-tokens token-principal)) ERR_INVALID_TOKEN)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> bonus-rate u0) ERR_INVALID_LOCK_PERIOD)
+    (asserts! (is-none existing-lock) ERR_ALREADY_EXISTS)
+    (unwrap! (contract-call? token-contract transfer amount tx-sender (as-contract tx-sender) none) ERR_TRANSFER_FAILED)
+    (unwrap-panic (update-rewards tx-sender token-principal))
+    (map-set locked-deposits { user: tx-sender, token: token-principal } 
+      { amount: deposit-amount, unlock-block: unlock-block, bonus-rate: bonus-rate, deposit-block: stacks-block-height })
+    (map-set total-deposits token-principal (+ total-token-deposits deposit-amount))
+    (ok deposit-amount)
+  )
+)
+
+(define-public (withdraw-locked (token-contract <sip010-token>))
+  (let
+    (
+      (token-principal (contract-of token-contract))
+      (lock-info (unwrap! (map-get? locked-deposits { user: tx-sender, token: token-principal }) ERR_NOT_FOUND))
+      (locked-amount (get amount lock-info))
+      (unlock-block (get unlock-block lock-info))
+      (total-token-deposits (default-to u0 (map-get? total-deposits token-principal)))
+    )
+    (asserts! (default-to false (map-get? supported-tokens token-principal)) ERR_INVALID_TOKEN)
+    (asserts! (>= stacks-block-height unlock-block) ERR_STILL_LOCKED)
+    (unwrap! (as-contract (contract-call? token-contract transfer locked-amount tx-sender tx-sender none)) ERR_TRANSFER_FAILED)
+    (unwrap-panic (update-locked-rewards tx-sender token-principal))
+    (map-delete locked-deposits { user: tx-sender, token: token-principal })
+    (map-set total-deposits token-principal (- total-token-deposits locked-amount))
+    (ok locked-amount)
+  )
+)
+
+(define-private (update-locked-rewards (user principal) (token-contract principal))
+  (let
+    (
+      (lock-info (unwrap! (map-get? locked-deposits { user: user, token: token-contract }) ERR_NOT_FOUND))
+      (locked-amount (get amount lock-info))
+      (bonus-rate (get bonus-rate lock-info))
+      (deposit-block (get deposit-block lock-info))
+      (current-block-height stacks-block-height)
+      (blocks-locked (- current-block-height deposit-block))
+      (bonus-rewards (/ (* locked-amount bonus-rate blocks-locked) u10000))
+      (current-rewards (default-to u0 (map-get? user-earned-rewards { user: user, token: token-contract })))
+    )
+    (map-set user-earned-rewards { user: user, token: token-contract } (+ current-rewards bonus-rewards))
+    (ok bonus-rewards)
+  )
+)
+
+(define-read-only (get-locked-deposit (user principal) (token-contract principal))
+  (map-get? locked-deposits { user: user, token: token-contract })
+)
+
+(define-read-only (get-lock-period-rate (lock-blocks uint))
+  (default-to u0 (map-get? lock-period-rates lock-blocks))
+)
+
+(define-read-only (is-deposit-unlocked (user principal) (token-contract principal))
+  (match (map-get? locked-deposits { user: user, token: token-contract })
+    lock-info (>= stacks-block-height (get unlock-block lock-info))
+    true
+  )
+)
