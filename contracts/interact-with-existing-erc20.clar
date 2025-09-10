@@ -11,6 +11,8 @@
 (define-constant ERR_NO_REWARDS (err u109))
 (define-constant ERR_STILL_LOCKED (err u110))
 (define-constant ERR_INVALID_LOCK_PERIOD (err u111))
+(define-constant ERR_SELF_REFERRAL (err u112))
+(define-constant ERR_REFERRAL_EXISTS (err u113))
 
 (define-map supported-tokens principal bool)
 (define-map user-deposits { user: principal, token: principal } uint)
@@ -21,10 +23,14 @@
 (define-map token-reward-rates principal uint)
 (define-map locked-deposits { user: principal, token: principal } { amount: uint, unlock-block: uint, bonus-rate: uint, deposit-block: uint })
 (define-map lock-period-rates uint uint)
+(define-map user-referrer principal principal)
+(define-map referral-earnings { user: principal, token: principal } uint)
+(define-map referral-counts principal uint)
 
 (define-data-var contract-paused bool false)
 (define-data-var deposit-fee uint u50)
 (define-data-var withdrawal-fee uint u25)
+(define-data-var referral-rate uint u500)
 
 (define-trait sip010-token
   (
@@ -86,6 +92,7 @@
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
     (unwrap! (contract-call? token-contract transfer amount tx-sender (as-contract tx-sender) none) ERR_TRANSFER_FAILED)
     (unwrap-panic (update-rewards tx-sender token-principal))
+    (unwrap-panic (process-referral-reward tx-sender token-principal deposit-amount))
     (map-set user-deposits { user: tx-sender, token: token-principal } (+ current-deposit deposit-amount))
     (map-set total-deposits token-principal (+ total-token-deposits deposit-amount))
     (ok deposit-amount)
@@ -319,6 +326,7 @@
     (asserts! (is-none existing-lock) ERR_ALREADY_EXISTS)
     (unwrap! (contract-call? token-contract transfer amount tx-sender (as-contract tx-sender) none) ERR_TRANSFER_FAILED)
     (unwrap-panic (update-rewards tx-sender token-principal))
+    (unwrap-panic (process-referral-reward tx-sender token-principal deposit-amount))
     (map-set locked-deposits { user: tx-sender, token: token-principal } 
       { amount: deposit-amount, unlock-block: unlock-block, bonus-rate: bonus-rate, deposit-block: stacks-block-height })
     (map-set total-deposits token-principal (+ total-token-deposits deposit-amount))
@@ -375,4 +383,66 @@
     lock-info (>= stacks-block-height (get unlock-block lock-info))
     true
   )
+)
+
+(define-public (set-referrer (referrer principal))
+  (begin
+    (asserts! (not (is-eq tx-sender referrer)) ERR_SELF_REFERRAL)
+    (asserts! (is-none (map-get? user-referrer tx-sender)) ERR_REFERRAL_EXISTS)
+    (map-set user-referrer tx-sender referrer)
+    (map-set referral-counts referrer (+ (default-to u0 (map-get? referral-counts referrer)) u1))
+    (ok referrer)
+  )
+)
+
+(define-public (set-referral-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-rate u2000) ERR_INVALID_AMOUNT)
+    (var-set referral-rate new-rate)
+    (ok new-rate)
+  )
+)
+
+(define-public (claim-referral-rewards (token-contract principal))
+  (let
+    (
+      (user-rewards (default-to u0 (map-get? referral-earnings { user: tx-sender, token: token-contract })))
+    )
+    (asserts! (default-to false (map-get? supported-tokens token-contract)) ERR_INVALID_TOKEN)
+    (asserts! (> user-rewards u0) ERR_NO_REWARDS)
+    (map-delete referral-earnings { user: tx-sender, token: token-contract })
+    (ok user-rewards)
+  )
+)
+
+(define-private (process-referral-reward (user principal) (token-contract principal) (deposit-amount uint))
+  (match (map-get? user-referrer user)
+    referrer 
+      (let
+        (
+          (reward-amount (/ (* deposit-amount (var-get referral-rate)) u10000))
+          (current-earnings (default-to u0 (map-get? referral-earnings { user: referrer, token: token-contract })))
+        )
+        (map-set referral-earnings { user: referrer, token: token-contract } (+ current-earnings reward-amount))
+        (ok reward-amount)
+      )
+    (ok u0)
+  )
+)
+
+(define-read-only (get-referrer (user principal))
+  (map-get? user-referrer user)
+)
+
+(define-read-only (get-referral-count (user principal))
+  (default-to u0 (map-get? referral-counts user))
+)
+
+(define-read-only (get-referral-earnings (user principal) (token-contract principal))
+  (default-to u0 (map-get? referral-earnings { user: user, token: token-contract }))
+)
+
+(define-read-only (get-referral-rate)
+  (var-get referral-rate)
 )
