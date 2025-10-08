@@ -13,6 +13,8 @@
 (define-constant ERR_INVALID_LOCK_PERIOD (err u111))
 (define-constant ERR_SELF_REFERRAL (err u112))
 (define-constant ERR_REFERRAL_EXISTS (err u113))
+(define-constant ERR_COMPOUNDING_DISABLED (err u114))
+(define-constant ERR_MIN_COMPOUND_NOT_MET (err u115))
 
 (define-map supported-tokens principal bool)
 (define-map user-deposits { user: principal, token: principal } uint)
@@ -26,11 +28,16 @@
 (define-map user-referrer principal principal)
 (define-map referral-earnings { user: principal, token: principal } uint)
 (define-map referral-counts principal uint)
+(define-map auto-compound-enabled { user: principal, token: principal } bool)
+(define-map last-compound-block { user: principal, token: principal } uint)
+(define-map total-compounded { user: principal, token: principal } uint)
 
 (define-data-var contract-paused bool false)
 (define-data-var deposit-fee uint u50)
 (define-data-var withdrawal-fee uint u25)
 (define-data-var referral-rate uint u500)
+(define-data-var min-compound-amount uint u1000)
+(define-data-var compound-interval uint u144)
 
 (define-trait sip010-token
   (
@@ -445,4 +452,102 @@
 
 (define-read-only (get-referral-rate)
   (var-get referral-rate)
+)
+
+(define-public (enable-auto-compound (token-contract principal))
+  (begin
+    (asserts! (default-to false (map-get? supported-tokens token-contract)) ERR_INVALID_TOKEN)
+    (map-set auto-compound-enabled { user: tx-sender, token: token-contract } true)
+    (map-set last-compound-block { user: tx-sender, token: token-contract } stacks-block-height)
+    (ok true)
+  )
+)
+
+(define-public (disable-auto-compound (token-contract principal))
+  (begin
+    (asserts! (default-to false (map-get? supported-tokens token-contract)) ERR_INVALID_TOKEN)
+    (map-delete auto-compound-enabled { user: tx-sender, token: token-contract })
+    (ok true)
+  )
+)
+
+(define-public (compound-rewards (token-contract principal))
+  (let
+    (
+      (is-enabled (default-to false (map-get? auto-compound-enabled { user: tx-sender, token: token-contract })))
+      (last-compound (default-to u0 (map-get? last-compound-block { user: tx-sender, token: token-contract })))
+      (blocks-since-compound (- stacks-block-height last-compound))
+      (pending-rewards (get-pending-rewards tx-sender token-contract))
+      (current-deposit (default-to u0 (map-get? user-deposits { user: tx-sender, token: token-contract })))
+      (total-token-deposits (default-to u0 (map-get? total-deposits token-contract)))
+      (total-compounded-amount (default-to u0 (map-get? total-compounded { user: tx-sender, token: token-contract })))
+    )
+    (asserts! (default-to false (map-get? supported-tokens token-contract)) ERR_INVALID_TOKEN)
+    (asserts! is-enabled ERR_COMPOUNDING_DISABLED)
+    (asserts! (>= blocks-since-compound (var-get compound-interval)) ERR_INVALID_AMOUNT)
+    (asserts! (>= pending-rewards (var-get min-compound-amount)) ERR_MIN_COMPOUND_NOT_MET)
+    (unwrap-panic (update-rewards tx-sender token-contract))
+    (map-set user-deposits { user: tx-sender, token: token-contract } (+ current-deposit pending-rewards))
+    (map-set total-deposits token-contract (+ total-token-deposits pending-rewards))
+    (map-delete user-earned-rewards { user: tx-sender, token: token-contract })
+    (map-set last-compound-block { user: tx-sender, token: token-contract } stacks-block-height)
+    (map-set total-compounded { user: tx-sender, token: token-contract } (+ total-compounded-amount pending-rewards))
+    (ok pending-rewards)
+  )
+)
+
+(define-public (set-min-compound-amount (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+    (var-set min-compound-amount new-amount)
+    (ok new-amount)
+  )
+)
+
+(define-public (set-compound-interval (new-interval uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-interval u0) ERR_INVALID_AMOUNT)
+    (var-set compound-interval new-interval)
+    (ok new-interval)
+  )
+)
+
+(define-read-only (is-auto-compound-enabled (user principal) (token-contract principal))
+  (default-to false (map-get? auto-compound-enabled { user: user, token: token-contract }))
+)
+
+(define-read-only (get-last-compound-block (user principal) (token-contract principal))
+  (default-to u0 (map-get? last-compound-block { user: user, token: token-contract }))
+)
+
+(define-read-only (get-total-compounded (user principal) (token-contract principal))
+  (default-to u0 (map-get? total-compounded { user: user, token: token-contract }))
+)
+
+(define-read-only (get-compound-settings)
+  {
+    min-amount: (var-get min-compound-amount),
+    interval: (var-get compound-interval)
+  }
+)
+
+(define-read-only (can-compound (user principal) (token-contract principal))
+  (let
+    (
+      (is-enabled (default-to false (map-get? auto-compound-enabled { user: user, token: token-contract })))
+      (last-compound (default-to u0 (map-get? last-compound-block { user: user, token: token-contract })))
+      (blocks-since-compound (- stacks-block-height last-compound))
+      (pending-rewards (get-pending-rewards user token-contract))
+    )
+    {
+      enabled: is-enabled,
+      interval-met: (>= blocks-since-compound (var-get compound-interval)),
+      min-amount-met: (>= pending-rewards (var-get min-compound-amount)),
+      can-execute: (and is-enabled 
+                       (>= blocks-since-compound (var-get compound-interval))
+                       (>= pending-rewards (var-get min-compound-amount)))
+    }
+  )
 )
