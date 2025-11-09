@@ -551,3 +551,31 @@
     }
   )
 )
+
+(define-private (make-portfolio-item (token principal))
+  (let
+    (
+      (supported (default-to false (map-get? supported-tokens token)))
+      (deposit (default-to u0 (map-get? user-deposits { user: tx-sender, token: token })))
+      (pending (get-pending-rewards tx-sender token))
+      (lock-opt (map-get? locked-deposits { user: tx-sender, token: token }))
+      (locked (is-some lock-opt))
+      (compound-enabled (default-to false (map-get? auto-compound-enabled { user: tx-sender, token: token })))
+      (compound-info (can-compound tx-sender token))
+      (can-execute (get can-execute compound-info))
+    )
+    {
+      token: token,
+      supported: supported,
+      deposit: deposit,
+      pending-rewards: pending,
+      locked: locked,
+      auto-compound: compound-enabled,
+      can-compound: can-execute
+    }
+  )
+)
+
+(define-read-only (get-my-portfolio (tokens (list 50 principal)))
+  (map make-portfolio-item tokens)
+)
